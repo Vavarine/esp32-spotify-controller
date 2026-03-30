@@ -35,7 +35,7 @@ constexpr unsigned long FETCH_INTERVAL_MS = 1000;
 constexpr unsigned long UI_IDLE_REFRESH_MS = 250;
 constexpr unsigned long UI_FEEDBACK_DURATION_MS = 1200;
 constexpr unsigned long OPTIMISTIC_PLAYBACK_WINDOW_MS = 1500;
-constexpr unsigned long PLAY_PAUSE_GUARD_MS = 350;
+constexpr unsigned long PLAY_PAUSE_GUARD_MS = 150;
 constexpr unsigned long ALBUM_ART_REFRESH_INTERVAL_MS = 10000;
 constexpr uint32_t TFT_SPI_FREQUENCY = 40000000;
 constexpr bool INVERT_DISPLAY_COLORS = false;
@@ -78,6 +78,7 @@ struct SpotifyState {
   String albumImageUrl;
   bool playing;
   bool valid;
+  bool requestSucceeded;
 };
 
 struct UiFeedback {
@@ -204,7 +205,10 @@ SpotifyState fetch_spotify_state() {
   response data = sp.get_currently_playing_track(filter);
   unlock_spotify();
 
-  if (data.status_code >= 200 && data.status_code < 300 && !data.reply.isNull()) {
+  newState.requestSucceeded =
+      data.status_code >= 200 && data.status_code < 300;
+
+  if (newState.requestSucceeded && !data.reply.isNull()) {
     newState.playing = data.reply["is_playing"].as<bool>();
     newState.track = data.reply["item"]["name"].as<String>();
 
@@ -603,8 +607,12 @@ void load_album_art() {
 void spotify_fetch_task(void*) {
   for (;;) {
     SpotifyState state = fetch_spotify_state();
-    store_spotify_state(state);
-    update_pending_album_art_url(state.albumImageUrl);
+
+    if (state.requestSucceeded) {
+      store_spotify_state(state);
+      update_pending_album_art_url(state.albumImageUrl);
+    }
+
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(FETCH_INTERVAL_MS));
   }
 }
@@ -671,6 +679,7 @@ void player_task(void*) {
       if (action == PlayerAction::PlayPause) {
         xSemaphoreTake(stateMutex, portMAX_DELAY);
         playPauseInFlight = false;
+        playPauseGuardUntilMs = 0;
         xSemaphoreGive(stateMutex);
       }
 
