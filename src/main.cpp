@@ -656,7 +656,6 @@ void setup() {
 
   playerQueue = xQueueCreate(8, sizeof(PlayerAction));
 
-  // 🚨 STACK AUMENTADA (FIX DO CRASH)
   xTaskCreatePinnedToCore(player_task, "player", 6144, nullptr, 3, nullptr, 1);
   xTaskCreatePinnedToCore(
     spotify_fetch_task,
