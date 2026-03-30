@@ -28,6 +28,9 @@ constexpr uint8_t TFT_RST_PIN = 21;
 // ===================== CONFIG =====================
 constexpr unsigned long BUTTON_DEBOUNCE_MS = 25;
 constexpr unsigned long BUTTON_STARTUP_IGNORE_MS = 750;
+constexpr unsigned long PLAYER_QUEUE_WAIT_MS = 75;
+constexpr unsigned long SPOTIFY_ACTION_LOCK_WAIT_MS = 1500;
+constexpr unsigned long SPOTIFY_FETCH_LOCK_WAIT_MS = 25;
 constexpr unsigned long FETCH_INTERVAL_MS = 1000;
 constexpr unsigned long UI_IDLE_REFRESH_MS = 250;
 constexpr unsigned long UI_FEEDBACK_DURATION_MS = 1200;
@@ -43,12 +46,13 @@ constexpr uint16_t TRACK_TEXT_COLOR = ST77XX_WHITE;
 constexpr uint16_t ARTIST_TEXT_COLOR = ST77XX_YELLOW;
 constexpr uint16_t ALBUM_BORDER_COLOR = ST77XX_WHITE;
 
-constexpr int ALBUM_ART_X = 128;
-constexpr int ALBUM_ART_Y = 44;
 constexpr int ALBUM_ART_SIZE = 64;
+constexpr int ALBUM_ART_SCALE = 2;
+constexpr int ALBUM_ART_DRAW_SIZE = ALBUM_ART_SIZE * ALBUM_ART_SCALE;
 constexpr int STATUS_Y = 10;
-constexpr int TRACK_Y = 122;
-constexpr int ARTIST_Y = 160;
+constexpr int ALBUM_ART_Y = 44;
+constexpr int TRACK_Y = 186;
+constexpr int ARTIST_Y = 214;
 
 // ===================== STRUCTS =====================
 struct ButtonState {
@@ -117,6 +121,9 @@ unsigned long playPauseGuardUntilMs = 0;
 // ===================== HELPERS =====================
 void lock_spotify() { xSemaphoreTake(spotifyMutex, portMAX_DELAY); }
 void unlock_spotify() { xSemaphoreGive(spotifyMutex); }
+bool try_lock_spotify(TickType_t timeoutTicks) {
+  return xSemaphoreTake(spotifyMutex, timeoutTicks) == pdTRUE;
+}
 
 void lock_display() { xSemaphoreTake(displayMutex, portMAX_DELAY); }
 void unlock_display() { xSemaphoreGive(displayMutex); }
@@ -187,7 +194,10 @@ SpotifyState fetch_spotify_state() {
   JsonObject artist = filter["item"]["artists"].add<JsonObject>();
   artist["name"] = true;
 
-  lock_spotify();
+  if (!try_lock_spotify(pdMS_TO_TICKS(SPOTIFY_FETCH_LOCK_WAIT_MS))) {
+    return newState;
+  }
+
   response data = sp.get_currently_playing_track(filter);
   unlock_spotify();
 
@@ -236,13 +246,27 @@ void set_optimistic_playing(bool playing) {
 }
 
 void update_pending_album_art_url(const String& url) {
+  bool shouldRefreshUi = false;
+
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-  if (url != globalAlbumArt.currentUrl && url != globalAlbumArt.pendingUrl) {
+  if (url.isEmpty()) {
+    if (globalAlbumArt.hasImage || !globalAlbumArt.currentUrl.isEmpty()) {
+      globalAlbumArt.currentUrl = "";
+      globalAlbumArt.pendingUrl = "";
+      globalAlbumArt.hasImage = false;
+      globalAlbumArt.loading = false;
+      globalAlbumArt.dirty = true;
+      shouldRefreshUi = true;
+    }
+  } else if (url != globalAlbumArt.currentUrl && url != globalAlbumArt.pendingUrl) {
     globalAlbumArt.pendingUrl = url;
     globalAlbumArt.loading = !url.isEmpty();
-    globalAlbumArt.dirty = true;
   }
   xSemaphoreGive(stateMutex);
+
+  if (shouldRefreshUi) {
+    request_ui_refresh();
+  }
 
   if (!url.isEmpty()) {
     request_album_art_refresh();
@@ -272,7 +296,7 @@ bool try_enqueue_player_action(PlayerAction action, unsigned long now) {
     xSemaphoreGive(stateMutex);
   }
 
-  if (xQueueSend(playerQueue, &action, 0) == pdTRUE) {
+  if (xQueueSend(playerQueue, &action, pdMS_TO_TICKS(PLAYER_QUEUE_WAIT_MS)) == pdTRUE) {
     return true;
   }
 
@@ -330,6 +354,21 @@ void connect_wifi() {
 }
 
 // ===================== DISPLAY =====================
+void draw_scaled_album_art(int x, int y) {
+  for (int row = 0; row < ALBUM_ART_SIZE; ++row) {
+    for (int col = 0; col < ALBUM_ART_SIZE; ++col) {
+      const uint16_t color = globalAlbumArtPixels[row * ALBUM_ART_SIZE + col];
+      tft.fillRect(
+        x + (col * ALBUM_ART_SCALE),
+        y + (row * ALBUM_ART_SCALE),
+        ALBUM_ART_SCALE,
+        ALBUM_ART_SCALE,
+        color
+      );
+    }
+  }
+}
+
 void draw_track_if_changed() {
   static String lastTrack;
   static String lastArtist;
@@ -370,10 +409,10 @@ void draw_track_if_changed() {
   lock_display();
 
   const int screenWidth = tft.width();
+  const int albumArtX = (screenWidth - ALBUM_ART_DRAW_SIZE) / 2;
 
   if (!initialized) {
     tft.fillScreen(SCREEN_BG_COLOR);
-    initialized = true;
   }
 
   tft.setTextWrap(false);
@@ -390,22 +429,34 @@ void draw_track_if_changed() {
   }
 
   if (!initialized || albumArt.dirty || albumArt.hasImage != lastAlbumHasImage) {
-    tft.fillRect(ALBUM_ART_X - 2, ALBUM_ART_Y - 2, ALBUM_ART_SIZE + 4, ALBUM_ART_SIZE + 4, SCREEN_BG_COLOR);
-    tft.drawRect(ALBUM_ART_X - 1, ALBUM_ART_Y - 1, ALBUM_ART_SIZE + 2, ALBUM_ART_SIZE + 2, ALBUM_BORDER_COLOR);
+    tft.fillRect(
+      albumArtX - 2,
+      ALBUM_ART_Y - 2,
+      ALBUM_ART_DRAW_SIZE + 4,
+      ALBUM_ART_DRAW_SIZE + 4,
+      SCREEN_BG_COLOR
+    );
+    tft.drawRect(
+      albumArtX - 1,
+      ALBUM_ART_Y - 1,
+      ALBUM_ART_DRAW_SIZE + 2,
+      ALBUM_ART_DRAW_SIZE + 2,
+      ALBUM_BORDER_COLOR
+    );
 
     if (albumArt.hasImage) {
-      tft.drawRGBBitmap(ALBUM_ART_X, ALBUM_ART_Y, globalAlbumArtPixels, ALBUM_ART_SIZE, ALBUM_ART_SIZE);
+      draw_scaled_album_art(albumArtX, ALBUM_ART_Y);
     } else {
-      tft.fillRect(ALBUM_ART_X, ALBUM_ART_Y, ALBUM_ART_SIZE, ALBUM_ART_SIZE, SCREEN_BG_COLOR);
-      tft.setCursor(ALBUM_ART_X + 10, ALBUM_ART_Y + 28);
+      tft.fillRect(albumArtX, ALBUM_ART_Y, ALBUM_ART_DRAW_SIZE, ALBUM_ART_DRAW_SIZE, SCREEN_BG_COLOR);
+      tft.setCursor(albumArtX + 40, ALBUM_ART_Y + 60);
       tft.setTextColor(TRACK_TEXT_COLOR, SCREEN_BG_COLOR);
-      tft.setTextSize(1);
-      tft.print("Sem capa");
+      tft.setTextSize(2);
+      tft.print("...");
     }
   }
 
   if (!initialized || state.track != lastTrack) {
-    tft.fillRect(0, 116, screenWidth, 28, SCREEN_BG_COLOR);
+    tft.fillRect(0, 176, screenWidth, 26, SCREEN_BG_COLOR);
     tft.setCursor(12, TRACK_Y);
     tft.setTextColor(TRACK_TEXT_COLOR, SCREEN_BG_COLOR);
     tft.setTextSize(2);
@@ -413,7 +464,7 @@ void draw_track_if_changed() {
   }
 
   if (!initialized || state.artist != lastArtist) {
-    tft.fillRect(0, 154, screenWidth, 28, SCREEN_BG_COLOR);
+    tft.fillRect(0, 204, screenWidth, 26, SCREEN_BG_COLOR);
     tft.setCursor(12, ARTIST_Y);
     tft.setTextColor(ARTIST_TEXT_COLOR, SCREEN_BG_COLOR);
     tft.setTextSize(2);
@@ -421,6 +472,8 @@ void draw_track_if_changed() {
   }
 
   unlock_display();
+
+  initialized = true;
 
   lastTrack = state.track;
   lastArtist = state.artist;
@@ -572,7 +625,16 @@ void player_task(void*) {
 
   for (;;) {
     if (xQueueReceive(playerQueue, &action, portMAX_DELAY)) {
-      lock_spotify();
+      if (!try_lock_spotify(pdMS_TO_TICKS(SPOTIFY_ACTION_LOCK_WAIT_MS))) {
+        if (action == PlayerAction::PlayPause) {
+          xSemaphoreTake(stateMutex, portMAX_DELAY);
+          playPauseInFlight = false;
+          xSemaphoreGive(stateMutex);
+        }
+
+        set_ui_feedback("Tente novamente");
+        continue;
+      }
 
       switch (action) {
         case PlayerAction::Previous:
