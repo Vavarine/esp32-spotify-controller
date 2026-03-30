@@ -46,6 +46,9 @@ constexpr uint16_t TRACK_TEXT_COLOR = ST77XX_WHITE;
 constexpr uint16_t ARTIST_TEXT_COLOR = ST77XX_YELLOW;
 constexpr uint16_t ALBUM_BORDER_COLOR = ST77XX_WHITE;
 
+constexpr BaseType_t UI_TASK_CORE = 0;
+constexpr BaseType_t APP_TASK_CORE = 1;
+
 constexpr int ALBUM_ART_SIZE = 64;
 constexpr int ALBUM_ART_SCALE = 2;
 constexpr int ALBUM_ART_DRAW_SIZE = ALBUM_ART_SIZE * ALBUM_ART_SCALE;
@@ -718,7 +721,7 @@ void setup() {
 
   playerQueue = xQueueCreate(8, sizeof(PlayerAction));
 
-  xTaskCreatePinnedToCore(player_task, "player", 6144, nullptr, 3, nullptr, 1);
+  xTaskCreatePinnedToCore(player_task, "player", 6144, nullptr, 3, nullptr, APP_TASK_CORE);
   xTaskCreatePinnedToCore(
     spotify_fetch_task,
     "fetch",
@@ -726,7 +729,7 @@ void setup() {
     nullptr,
     1,
     &spotifyFetchTaskHandle,
-    1
+    APP_TASK_CORE
   );
   xTaskCreatePinnedToCore(
     album_art_task,
@@ -735,9 +738,9 @@ void setup() {
     nullptr,
     1,
     &albumArtTaskHandle,
-    1
+    APP_TASK_CORE
   );
-  xTaskCreatePinnedToCore(ui_task, "ui", 6144, nullptr, 2, &uiTaskHandle, 1);
+  xTaskCreatePinnedToCore(ui_task, "ui", 6144, nullptr, 2, &uiTaskHandle, UI_TASK_CORE);
 
   request_spotify_refresh();
 }
